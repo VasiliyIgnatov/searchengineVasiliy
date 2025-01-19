@@ -9,12 +9,14 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 import searchengine.config.Site;
 import searchengine.config.SitesList;
 import searchengine.dto.statistics.IndexingResponse;
+import searchengine.dto.statistics.UrlPage;
 import searchengine.model.PageModel;
 import searchengine.model.SiteModel;
 import searchengine.model.Status;
 import searchengine.repositories.PageRepository;
 import searchengine.repositories.SiteRepository;
 
+import java.net.URL;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -33,6 +35,7 @@ public class StartIndexingServer implements IndexingService<IndexingResponse>{
     private final SiteRepository siteRepository;
     private final AtomicBoolean isIndexing = new AtomicBoolean(false);
     private final ExecutorService executorService = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors());
+    private final PageService pageService;
 
     @Transactional
     @Override
@@ -62,24 +65,29 @@ public class StartIndexingServer implements IndexingService<IndexingResponse>{
 
     @Transactional
     @Override
-    public synchronized IndexingResponse indexPage(String url) {
-        log.info("Current isIndexing value: {}", isIndexing.get());
-
-        if (pageRepository.findByPath(url) == null) {
+    public synchronized IndexingResponse indexPage(UrlPage url) {
+            if (!isValidUrl(url.getUrl())) {
             isIndexing.set(false);
             log.error("Page not found = {}", url);
             return createErrorResponse("Данная страница находится за пределами сайтов" +
                     " указанных в конфигурационном файле");
         }
         isIndexing.set(true);
-        log.info("Indexing page = {}", url);
-            PageModel pageModel = new PageModel();
-            pageModel.setPath(url);
-            pageRepository.save(pageModel);
-            log.info("New page model created for URL: {}", url);
+        if (pageRepository.existsByPath(url.getUrl())) {
+            log.info("Indexing page = {}", url);
+            PageModel pageModel = pageRepository.findByPath(url.getUrl());
+            pageRepository.delete(pageModel);
+            log.info("Page model delete for URL: {}", url);
 
-        PagesIndexing(pageModel.getSite(), url);
-        log.info("indexPage = {}", url);
+            PagesIndexing(pageModel.getSite(), url.getUrl());
+            log.info("indexPage = {}", url);
+        } else {
+            SiteModel siteModel = new SiteModel();
+            siteModel.setUrl(url.getUrl());
+            siteRepository.save(siteModel);
+            IndexingPages indexingPages = new IndexingPages(isIndexing, url.getUrl(), pageRepository, siteRepository, siteModel, pageService);
+            indexingPages.compute();
+        }
         return createSuccessResponse();
     }
 
@@ -92,8 +100,8 @@ public class StartIndexingServer implements IndexingService<IndexingResponse>{
             }
             SiteModel siteModel = siteRepository.findByUrl(site.getUrl());
             if (siteModel != null) {
-                if (TransactionSynchronizationManager.isActualTransactionActive()) {
-                    log.info("No active transaction found! = {}", siteModel);
+                if (!TransactionSynchronizationManager.isActualTransactionActive()) {
+                    log.info("Не найдена активная транзакция! = {}", siteModel);
                 }
                 pageRepository.deleteBySite(siteModel);
                 siteRepository.delete(siteModel);
@@ -134,7 +142,7 @@ public class StartIndexingServer implements IndexingService<IndexingResponse>{
             return;
         ForkJoinPool pool = new ForkJoinPool();
         try {
-            pool.invoke(new IndexingPages(isIndexing, url, pageRepository, siteRepository, siteModel));
+            pool.invoke(new IndexingPages(isIndexing, url, pageRepository, siteRepository, siteModel, pageService));
         } finally {
             pool.shutdown();
         }
@@ -151,6 +159,16 @@ public class StartIndexingServer implements IndexingService<IndexingResponse>{
         IndexingResponse indexingResponse = new IndexingResponse();
         indexingResponse.setResult(true);
         return indexingResponse;
+    }
+
+    private boolean isValidUrl(String url) {
+        try {
+            new URL(url).toURI();
+            return true;
+        } catch (Exception e) {
+            log.error("Invalid URL: {}", url);
+            return false;
+        }
     }
 }
 
